@@ -4,6 +4,8 @@
 
 #Import the necessary packages
 
+from flask import Flask, render_template, Response, request
+from requests_toolbelt import MultipartEncoder
 import os
 import sys
 sys.path.append('./yolov7-face')
@@ -15,6 +17,8 @@ import torch
 import numpy as np
 import torch.backends.cudnn as cudnn
 from numpy import random
+import json
+import urllib3
 
 from models.experimental import attempt_load
 from utils.datasets import LoadStreams, LoadImages
@@ -26,12 +30,12 @@ from utils.torch_utils import select_device, load_classifier, time_synchronized
 classes_to_filter = ['train'] 
 
 opt = {
-    "weights" : "weights/yolov7-face.pt",
+    "weights" : "weights/yolov7-tiny-face.pt",
     "source" : "yolov7-face/data/widerface.yaml",
     "img_size" : 640,
     "conf_thres" : 0.4,
     "iou_thres" : 0.5,
-    "device" : "0",
+    "device" : "cpu",
     "classes" : classes_to_filter,
 }
 
@@ -54,9 +58,11 @@ torch.cuda.empty_cache()
 #Define the function to calculate the distance between the camera and the face
 def distance_to_camera(knownWidth, focalLength, perWidth):
     # compute and return the distance from the maker to the camera
-    focalLength = (1280 * 50) / knownWidth
+    focalLength = (1280 * 42) / knownWidth
     distance = (knownWidth * focalLength) / (perWidth * 10)
-    # print(f"Distance: {distance} cm, Focal Length: {focalLength} px")
+    # parse distance from tensor to float
+    distance = distance.item()
+    # print(distance)
     return distance
     
 #Define the function for the bounding box
@@ -125,6 +131,8 @@ def detect_face_distance(frame):
         # Apply NMS
         pred = non_max_suppression(pred, opt['conf_thres'], opt['iou_thres'], classes=[0], agnostic=False)
         t2 = time_synchronized()
+        positions = []
+
         for i, det in enumerate(pred):
             s = ''
             s += '%gx%g ' % img.shape[2:]  # print string
@@ -139,28 +147,61 @@ def detect_face_distance(frame):
                     s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
 
                 for *xyxy, conf, cls in reversed(det):
-                    distance = distance_to_camera(knownWidth=150, focalLength=0, perWidth=xyxy[2]-xyxy[0])
+                    distance = distance_to_camera(knownWidth=170, focalLength=0, perWidth=xyxy[2]-xyxy[0])
                     # label = f'{names[int(cls)]} {conf:.2f}'
                     label = f' {distance}cm'
-
+                    # distances[len(distances) + 1] = distance
+                    # add to positions dictionary how many pixels to center the face and the distance from the camera
+                    # turn xyxy[0] and xyxy[2] into single value and add to positions
+                    x1 = (int(xyxy[0]) + int(xyxy[2])) / 2
+                    x2 = x1 + int(xyxy[2]) - int(xyxy[0])
+                    # get the difference between the center of x1 and x2 and the center of the frame and add to positions
+                    diff = (x1 + x2) / 2 - 240
+                    positions.append([diff, distance])
+                    
                     #Draw the bounding box
                     plot_one_box(xyxy, frame, label=label, color=colors[int(cls)], line_thickness=3)
 
-        return frame
+        return frame, positions
 
 #Define the function to show the video
 def gen(camera):
     # use opencv to display the video
     while True:
         frame = camera.get_frame()
-        frame = detect_face_distance(frame)
+        frame, _ = detect_face_distance(frame)
         cv2.imshow('frame', frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
     camera.release()
     cv2.destroyAllWindows()
 
-if __name__ == '__main__':
-    videoCam = VideoCamera()
-    gen(videoCam)
+# if __name__ == '__main__':
+#     videoCam = VideoCamera()
+#     gen(videoCam)
 
+app = Flask(__name__)
+
+#Home page
+@app.route("/")
+def hello_world():
+    return "<p>Hello, World!</p>"
+
+#create a flask api to get a frame from a post request and return the frame with the bounding box and json with the distance 
+@app.route('/video_feed', methods=['POST'])
+def video_feed():
+    # use opencv to display the video
+    frame = request.files['frame']
+    frame = np.fromstring(frame.read(), np.uint8)
+    frame = cv2.imdecode(frame, cv2.IMREAD_COLOR)
+    frame, distance = detect_face_distance(frame)
+    _, buffer = cv2.imencode('.jpg', frame)
+    frame = buffer.tobytes()
+    fields = {
+        'distance': str(distance),
+        'frame': (None, frame, 'image/jpeg')
+    }   
+
+    m = MultipartEncoder(fields=fields)
+
+    return (m.to_string(), 200, {'Content-Type': m.content_type})
